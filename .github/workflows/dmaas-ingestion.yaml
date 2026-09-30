@@ -1,0 +1,230 @@
+name: dmaas-ingestion-ci-cd
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: dmaas-ingestion
+  ECS_CLUSTER: dmaas-cluster
+  ECS_SERVICE: dmaas-ingestion-service
+  ECS_TASK_DEFINITION: infra/ecs-task-definition.json
+
+jobs:
+
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: |
+          black --check src
+          flake8 src
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run Tests
+        run: |
+          pytest \
+          --cov=src \
+          --cov-report=xml \
+          --cov-report=term
+
+      - name: Upload Coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  build-dependencies:
+    name: Build Connector Dependencies
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Dependency Package
+        run: |
+          mkdir -p build
+          pip install \
+            -r requirements.txt \
+            -t build/
+
+      - name: Upload Dependency Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-dependencies
+          path: build/
+
+  docker-build-scan-push:
+    name: Build Scan Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build-dependencies
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      image_uri: ${{ steps.image.outputs.image }}
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t $ECR_REPOSITORY:${{ github.sha }} .
+
+      - name: Scan Docker Image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Tag Image
+        run: |
+          docker tag \
+          $ECR_REPOSITORY:${{ github.sha }} \
+          ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+
+      - name: Push Image
+        run: |
+          docker push \
+          ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+
+      - name: Save Image URI
+        id: image
+        run: |
+          echo "image=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  package-lambda:
+    name: Package Lambda Handlers
+    runs-on: ubuntu-latest
+    needs: docker-build-scan-push
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package Lambdas
+        run: |
+          mkdir lambda-package
+
+          pip install \
+            -r lambda/requirements.txt \
+            -t lambda-package/
+
+          cp -R lambda/* lambda-package/
+
+          cd lambda-package
+          zip -r ../lambda.zip .
+
+      - name: Upload Lambda Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: lambda.zip
+
+  deploy-ecs:
+    name: Deploy ECS Service
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build-scan-push
+      - package-lambda
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+
+      - name: Update ECS Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: dmaas-ingestion
+          image: ${{ needs.docker-build-scan-push.outputs.image_uri }}
+
+      - name: Deploy ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-ecs
+
+    steps:
+      - name: Run Smoke Tests
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" $APP_URL/health)
+
+          if [ "$status" != "200" ]; then
+            echo "Smoke test failed"
+            exit 1
+          fi
+
+          echo "Smoke test passed"

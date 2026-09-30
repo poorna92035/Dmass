@@ -1,0 +1,178 @@
+name: React CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+
+jobs:
+
+  validate:
+    name: Validate & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Lint Validation
+        run: npm run lint
+
+      - name: Run Unit Tests
+        run: npm test -- --coverage --watchAll=false
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: validate
+
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Generate Image Tag
+        id: vars
+        run: |
+          TAG=${GITHUB_SHA::7}
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+          -t react-app:${{ steps.vars.outputs.image_tag }} \
+          .
+
+      - name: Save Image
+        run: |
+          docker save react-app:${{ steps.vars.outputs.image_tag }} \
+          -o react-app.tar
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: react-app.tar
+
+  twistlock-scan:
+    name: Prisma/Twistlock Scan
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Image
+        run: |
+          docker load -i react-app.tar
+
+      - name: Download Twistcli
+        run: |
+          curl -k \
+            -u "${{ secrets.TWISTLOCK_USERNAME }}:${{ secrets.TWISTLOCK_PASSWORD }}" \
+            https://${{ secrets.TWISTLOCK_CONSOLE_URL }}/api/v1/util/twistcli \
+            --output twistcli
+
+          chmod +x twistcli
+
+      - name: Scan Docker Image
+        run: |
+          ./twistcli images scan \
+          --address https://${{ secrets.TWISTLOCK_CONSOLE_URL }} \
+          --user ${{ secrets.TWISTLOCK_USERNAME }} \
+          --password ${{ secrets.TWISTLOCK_PASSWORD }} \
+          react-app:${{ needs.build.outputs.image_tag }}
+
+  push-ecr:
+    name: Push Image To ECR
+    runs-on: ubuntu-latest
+    needs: twistlock-scan
+
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login To Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+          -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+          .
+
+      - name: Tag Docker Image
+        run: |
+          docker tag \
+          ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Push Docker Image
+        run: |
+          docker push \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Set Image URI
+        id: image
+        run: |
+          echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy To ECS
+    runs-on: ubuntu-latest
+    needs: push-ecr
+
+    steps:
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force New Deployment
+        run: |
+          aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --force-new-deployment
+
+      - name: Wait For ECS Stability
+        run: |
+          aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+
+      - name: Deployment Completed
+        run: echo "ECS deployment completed successfully"

@@ -1,0 +1,78 @@
+name: dmaas-ingestion
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions: { id-token: write, contents: read }
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPO: ${{ vars.INGESTION_ECR_REPO }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.INGESTION_ECS_SERVICE }}
+  LAMBDA_NAME: ${{ vars.INGESTION_LAMBDA_NAME }}
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+
+      - name: 1. Validate
+        run: |
+          npm ci
+          npm run validate --if-present
+          docker run --rm -i hadolint/hadolint < Dockerfile
+
+      - name: 2. Unit tests
+        run: npm test
+
+      - name: 3. Build connector dependencies
+        run: npm run build:connectors
+
+      - name: 4. Build Docker image
+        run: docker build -t ingestion:${{ github.sha }} .
+
+      - name: 5. Scan image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ingestion:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 6. Push image to ECR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          IMG=${{ steps.ecr.outputs.registry }}/$ECR_REPO:${{ github.sha }}
+          docker tag ingestion:${{ github.sha }} $IMG
+          docker push $IMG
+
+      - name: 7. Package short-running Lambda handlers
+        run: |
+          npm run build:lambda
+          (cd dist-lambda && zip -r ../ingestion-lambda-${{ github.sha }}.zip .)
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            aws s3 cp ingestion-lambda-${{ github.sha }}.zip s3://$ARTIFACT_BUCKET/dmaas-ingestion/
+            aws lambda update-function-code --function-name $LAMBDA_NAME \
+              --s3-bucket $ARTIFACT_BUCKET --s3-key dmaas-ingestion/ingestion-lambda-${{ github.sha }}.zip
+          fi
+
+      - name: 8. Deploy ECS service
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+
+      - name: 9. Smoke test
+        if: github.ref == 'refs/heads/main'
+        run: curl -fsS --retry 5 --retry-delay 5 "${{ vars.INGESTION_HEALTH_URL }}"

@@ -1,0 +1,68 @@
+name: dmaas-auth
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions: { id-token: write, contents: read }
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+  ECR_REPO: ${{ vars.AUTH_ECR_REPO }}
+  FUNCTION_NAME: ${{ vars.AUTH_FUNCTION_NAME }}
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+
+      - name: 1. Validate
+        run: |
+          npm ci
+          npm run validate --if-present
+          docker run --rm -i hadolint/hadolint < Dockerfile
+
+      - name: 2. Unit tests
+        run: npm test
+
+      - name: 3. Security scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - name: 4. Build Lambda/container artifact
+        run: |
+          npm run build
+          (cd dist && zip -r ../auth-${{ github.sha }}.zip .)
+          docker build -t auth:${{ github.sha }} .
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 5. Publish artifact
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws s3 cp auth-${{ github.sha }}.zip s3://$ARTIFACT_BUCKET/dmaas-auth/
+          IMG=${{ steps.ecr.outputs.registry }}/$ECR_REPO:${{ github.sha }}
+          docker tag auth:${{ github.sha }} $IMG
+          docker push $IMG
+
+      - name: 6. Deploy Auth component
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws lambda update-function-code --function-name $FUNCTION_NAME \
+            --s3-bucket $ARTIFACT_BUCKET --s3-key dmaas-auth/auth-${{ github.sha }}.zip --publish
+          aws lambda wait function-updated --function-name $FUNCTION_NAME
+
+      - name: 7. Smoke test
+        if: github.ref == 'refs/heads/main'
+        run: curl -fsS --retry 5 --retry-delay 5 "${{ vars.AUTH_HEALTH_URL }}"
